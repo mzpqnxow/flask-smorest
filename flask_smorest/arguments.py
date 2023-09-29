@@ -14,6 +14,83 @@ class ArgumentsMixin:
 
     ARGUMENTS_PARSER = FlaskParser()
 
+    def multipart_arguments(
+        self,
+        schema,
+        *,
+        content_type=None,
+        required=True,
+        description=None,
+        example=None,
+        examples=None,
+        **kwargs
+    ):
+        # At this stage, put schema instance in doc dictionary. Il will be
+        # replaced later on by $ref or json.
+        parameters = {
+            "in": "files",
+            "required": required,
+            "schema": schema,
+        }
+        if content_type is not None:
+            parameters["content_type"] = content_type
+        if example is not None:
+            parameters["example"] = example
+        if examples is not None:
+            parameters["examples"] = examples
+        if description is not None:
+            parameters["description"] = description
+
+        error_status_code = kwargs.get(
+            "error_status_code", self.ARGUMENTS_PARSER.DEFAULT_VALIDATION_STATUS
+        )
+
+        def decorator(func):
+            arg_parser = self.ARGUMENTS_PARSER.use_args(
+                schema, location="files", **kwargs
+            )
+
+            @wraps(func)
+            def wrapper(*f_args, **f_kwargs):
+                req = self.ARGUMENTS_PARSER.get_default_request()
+                from werkzeug.datastructures import ImmutableMultiDict
+
+                data = []
+                orig_files = req.files
+                orig_form = req.form
+                for key in req.files:
+                    data.append((key, req.files[key]))
+                for key in req.form:
+                    data.append((key, req.form[key]))
+                req.form = None
+                req.files = ImmutableMultiDict(data)
+
+                try:
+                    result = arg_parser(func)(*f_args, **f_kwargs)
+                except Exception as e:
+                    req.files = orig_files
+                    req.form = orig_form
+                    raise e
+
+                req.files = orig_files
+                req.form = orig_form
+
+                return result
+
+            # Add parameter to parameters list in doc info in function object
+            # The deepcopy avoids modifying the wrapped function doc
+            wrapper._apidoc = deepcopy(getattr(wrapper, "_apidoc", {}))
+            docs = wrapper._apidoc.setdefault("arguments", {})
+            docs.setdefault("parameters", []).append(parameters)
+            docs.setdefault("responses", {})[error_status_code] = http.HTTPStatus(
+                error_status_code
+            ).name
+
+            # Call use_args (from webargs) to inject params in function
+            return wrapper
+
+        return decorator
+
     def arguments(
         self,
         schema,
@@ -108,7 +185,7 @@ class ArgumentsMixin:
             # OAS 2
             if spec.openapi_version.major < 3:
                 for param in parameters:
-                    if param["in"] in (self.DEFAULT_LOCATION_CONTENT_TYPE_MAPPING):
+                    if param["in"] in self.DEFAULT_LOCATION_CONTENT_TYPE_MAPPING:
                         content_type = (
                             param.pop("content_type", None)
                             or self.DEFAULT_LOCATION_CONTENT_TYPE_MAPPING[param["in"]]
